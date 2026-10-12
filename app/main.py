@@ -14,9 +14,9 @@ from typing import Optional
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator, model_validator
 from pymongo import MongoClient
-
+from datetime import date as dt
 load_dotenv()
 
 client = MongoClient(os.getenv("MONGO_URI", "mongodb://localhost:27017"))
@@ -51,13 +51,25 @@ def compute_overtime(punch_out: datetime, shift_end: str, date_str: str) -> int:
 # Models
 # --------------------------------------------------------------------------- #
 class EmployeeIn(BaseModel):
-    emp_code: str
-    name: str
-    email: str
-    department: str
-    shift_start: str = "09:30"
-    shift_end: str = "18:30"
-    joined_on: str
+    emp_code: str = Field(pattern=r'^EMP\d{4,6}$')
+    name: str = Field(min_length= 1 ,max_length=100)
+    email: str = Field(max_length= 120 , pattern= r'^[^@\s]+@[^@\s]+\.[^@\s]+$')
+    department: str = Field(min_length= 1, max_length=50)
+    shift_start: str = Field(default = "09:30", pattern=r'^([01]\d|2[0-3]):[0-5]\d$')
+    shift_end: str = Field (default ="18:30", pattern=r'^([01]\d|2[0-3]):[0-5]\d$')
+    joined_on: str = Field(pattern=r'^\d{4}-\d{2}-\d{2}$')
+    
+    @field_validator("joined_on")
+    @classmethod
+    def validate_joined_date(cls, v):
+        dt.fromisoformat(v)
+        return v
+    
+    @model_validator(mode="after")
+    def check_shift_val(self):
+        if self.shift_start == self.shift_end:
+            raise ValueError("shift values should be different")
+        return self
 
 
 class PunchInIn(BaseModel):
