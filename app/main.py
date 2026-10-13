@@ -38,10 +38,15 @@ def create_indexes():
 # Helpers
 # --------------------------------------------------------------------------- #
 def compute_late_minutes(punch_in: datetime, shift_start: str) -> int:
+    if punch_in.tzinfo is None:
+        punch_in = punch_in.replace(tzinfo=timezone.utc)
+    ist = punch_in.astimezone(IST).replace(microsecond=0)
     h, m = map(int, shift_start.split(":"))
-    start = punch_in.replace(hour=h, minute=m, second=0, microsecond=0) #why
-    minutes = int((punch_in - start).total_seconds() / 60)
-    return minutes if minutes > 10 else 0
+    start = ist.replace(hour=h, minute=m, second=0, microsecond=0)
+    diff_sec = (ist - start).total_seconds()
+    if diff_sec <= 10*60:
+        return 0
+    return int(diff_sec // 60)
 
 
 def compute_work_hours(punch_in: datetime, punch_out: datetime) -> float:
