@@ -189,6 +189,12 @@ def list_attendance(
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1 , le=100),
 ):
+    if date_from is not None:
+        dt.fromisoformat(date_from)
+    if date_to is not None:
+            dt.fromisoformat(date_to)
+    if date_from and date_to and date_from > date_to:
+        raise HTTPException(422 , "date_from can not be greater than date_to")
     q = {}
     if emp_code:
         q["emp_code"] = emp_code
@@ -200,13 +206,20 @@ def list_attendance(
             q["date"]["$lte"] = date_to
     if status:
         q["status"] = status
-    docs = list(db.attendance_logs.find(q))
-    docs.sort(key=lambda d: d["date"], reverse=True)
-    total = len(docs)
-    page_docs = docs[(page - 1) * page_size : page * page_size]
-    for d in page_docs:
-        d["id"] = str(d.pop("_id"))
-    return {"items": page_docs, "total": total, "page": page, "page_size": page_size}
+    total = db.attendance_logs.count_documents(q)
+    cur = db.attendance_logs.find(q, {"_id" : 0}).sort([("date", -1), ("emp_code", 1)]).skip((page - 1) * page_size).limit(page_size)
+    items = []
+    for d in cur:
+        d.pop("_id", None); d.pop("id", None)
+        d["punch_in"] = None if d.get("punch_in") is None else dt_to_ms(d["punch_in"])
+        d["punch_out"] = None if d.get("punch_out") is None else dt_to_ms(d["punch_out"])
+        d["half_day"] = d.get("half_day", False) or False
+        d["history"] = d.get("history", []) or []
+        d["late_minutes"] = d.get("late_minutes", 0) or 0
+        d["overtime_minutes"] = d.get("overtime_minutes", 0) or 0
+        items.append(d)
+    return {"items": items, "total": total, "page": page, "page_size": page_size}
+
 
 
 # --------------------------------------------------------------------------- #
