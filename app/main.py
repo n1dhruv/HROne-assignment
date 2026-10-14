@@ -58,10 +58,17 @@ def compute_work_hours(punch_in: datetime, punch_out: datetime) -> float:
     seconds = int((punch_out - punch_in).total_seconds())
     return float((Decimal(seconds)/Decimal(3600)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
 
-def compute_overtime(punch_out: datetime, shift_end: str, date_str: str) -> int:
-    h, m = map(int, shift_end.split(":"))
-    end = datetime.fromisoformat(date_str).replace(hour=h, minute=m, tzinfo=IST) #why
-    return max(0, int((punch_out - end).total_seconds() / 60))
+def compute_overtime(punch_out: datetime, shift_end: str, date_str: str, shift_start:str | None = None) -> int:
+    if punch_out.tzinfo is None:
+        punch_out = punch_out.replace(tzinfo=timezone.utc)
+    punch_ist = punch_out.astimezone(IST).replace(microsecond=0)
+    y , mo , d = map(int ,date_str.split("-"))
+    eh , em = map(int, shift_end.split(":"))
+    shift_end_ist = datetime(y , mo, d , eh , em , 0 , tzinfo=IST)
+    if shift_start is not None and shift_start >= shift_end:
+        shift_end_ist += timedelta(days=1)
+    mins =int((punch_ist - shift_end_ist).total_seconds() // 60)
+    return mins if mins >=30 else 0
 
 def attandance_date(punch_utc: datetime, shift_start: str, shift_end: str) -> str:
     ist = punch_utc.astimezone(IST)
