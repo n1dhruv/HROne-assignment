@@ -15,7 +15,7 @@ from typing import Optional
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field, StrictInt, field_validator, model_validator
-from pymongo import MongoClient
+from pymongo import MongoClient, ReturnDocument
 from datetime import date as dt
 from typing import Literal
 from pymongo.errors import DuplicateKeyError
@@ -123,6 +123,15 @@ class PunchInIn(BaseModel):
             raise ValueError("punched_at must be integer if supplied")
         return self
 
+class PunchOutIn(BaseModel):
+    emp_code: str
+    punched_at: Optional[StrictInt] = Field(default=None, ge=100000000000, le=4102444800000)
+
+    @model_validator(mode="after")
+    def reject_null_punched(self):
+        if "punched_at" in self.model_fields_set and self.punched_at is None:
+            raise ValueError("punched_at must be integer if supplied")
+        return self
 
 # --------------------------------------------------------------------------- #
 # Endpoints provided
@@ -256,7 +265,67 @@ def list_attendance(
         items.append(d)
     return {"items": items, "total": total, "page": page, "page_size": page_size}
 
-
+# --------------------- PART-B --------------------------------- #
+@app.post("/attendance/punch-out")
+def punchOut(body : PunchOutIn):
+    if body.punched_at is not None:
+        truncated_ms = (body.punched_at // 1000) * 1000
+        ts = datetime.fromtimestamp(truncated_ms / 1000 , tz = timezone.utc)
+    else:
+        ts = datetime.now(timezone.utc).replace(microsecond=0)
+    emp = db.employees.find_one({"emp_code" : body.emp_code})
+    if emp is None:
+        raise HTTPException(404, "Employee Not Found")
+    rec = db.attendance_logs.find_one({
+        "emp_code" : body.emp_code,
+        "punch_in" : {
+            "$lte" : ts
+        }
+    } , sort = [("punch_in", -1)])
+    if rec is None:
+        raise HTTPException(404, "Punch_in not found")
+    if rec["punch_out"] is not None:
+        raise HTTPException(409, "Already Punched Out")
+    punch_in_dt = rec["punch_in"]
+    if punch_in_dt.tzinfo is None:
+        punch_in_dt = punch_in_dt.replace(tzinfo=timezone.utc)
+    diff_sec = (ts - punch_in_dt).total_seconds()
+    if diff_sec <=0 or diff_sec > 24 * 3600:
+        raise HTTPException(422 , "invalid punched at")
+    wh = compute_work_hours(punch_in_dt , ts)
+    ot = compute_overtime(ts , emp["shift_end"] , rec["date"] , emp["shift_start"])
+    half = wh < 4.5
+    updated = db.attendance_logs.find_one_and_update({
+        "emp_code" : body.emp_code,
+         "date": rec["date"], 
+         "punch_out": None
+    }, {
+        "$set" : {
+            "punch_out" : ts,
+            "work_hours" : wh,
+            "overtime_minutes" : ot,
+            "half_day" : half
+        }
+    }, return_document=ReturnDocument.AFTER)
+    if updated is None:
+        cur = db.attendance_logs.find_one({"emp_code": body.emp_code, "date": rec["date"]})
+        if cur is not None and cur.get("punch_out") is not None:
+            raise HTTPException(409, "already punched out")
+        raise HTTPException(404, "no punch-in found")
+    updated.pop("_id", None)
+    updated["punch_in"] = dt_to_ms(updated["punch_in"])
+    updated["punch_out"] = dt_to_ms(updated["punch_out"])
+    updated["history"] = updated.get("history", []) or []
+    for h in updated["history"]:
+        if isinstance(h.get("at"), datetime):
+            h["at"] = dt_to_ms(h["at"])
+        for fk in ("punch_in", "punch_out"):
+            if fk in h.get("changes", {}):
+                for bk in ("from", "to"):
+                    v = h["changes"][fk].get(bk)
+                    if isinstance(v, datetime):
+                        h["changes"][fk][bk] = dt_to_ms(v)
+    return updated
 
 # --------------------------------------------------------------------------- #
 # TODO - the rest of the contract (see openapi.yaml):
