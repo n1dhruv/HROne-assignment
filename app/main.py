@@ -233,6 +233,15 @@ def list_attendance(
         d["history"] = d.get("history", []) or []
         d["late_minutes"] = d.get("late_minutes", 0) or 0
         d["overtime_minutes"] = d.get("overtime_minutes", 0) or 0
+        for h in d["history"]:
+            if isinstance(h.get("at"), datetime):
+                h["at"] = dt_to_ms(h["at"])
+            for fk in ("punch_in", "punch_out"):
+                if fk in h.get("changes", {}):
+                    for bk in ("from", "to"):
+                        v = h["changes"][fk].get(bk)
+                        if isinstance(v, datetime):
+                            h["changes"][fk][bk] = dt_to_ms(v)
         items.append(d)
     return {"items": items, "total": total, "page": page, "page_size": page_size}
 
