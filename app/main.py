@@ -37,12 +37,16 @@ def create_indexes():
 # --------------------------------------------------------------------------- #
 # Helpers
 # --------------------------------------------------------------------------- #
-def compute_late_minutes(punch_in: datetime, shift_start: str) -> int:
+def compute_late_minutes(punch_in: datetime, shift_start: str, shift_end: str | None = None) -> int:
     if punch_in.tzinfo is None:
         punch_in = punch_in.replace(tzinfo=timezone.utc)
     ist = punch_in.astimezone(IST).replace(microsecond=0)
     h, m = map(int, shift_start.split(":"))
     start = ist.replace(hour=h, minute=m, second=0, microsecond=0)
+    if shift_end is not None and shift_end <= shift_start:
+        eh, em = map(int, shift_end.split(":"))
+        if (ist.hour, ist.minute, ist.second) < (eh, em, 0):
+            start -= timedelta(days=1)
     diff_sec = (ist - start).total_seconds()
     if diff_sec <= 10*60:
         return 0
@@ -156,7 +160,7 @@ def punch_in(body: PunchInIn):
         "punch_in": ts,
         "punch_out": None,
         "work_hours": None,
-        "late_minutes": compute_late_minutes(ts, emp["shift_start"]),
+        "late_minutes": compute_late_minutes(ts, emp["shift_start"], emp["shift_end"]),
         "overtime_minutes": 0,
         "half_day": False,
         "history": [],
