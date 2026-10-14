@@ -279,16 +279,17 @@ def punchOut(body : PunchOutIn):
     rec = db.attendance_logs.find_one({
         "emp_code" : body.emp_code,
         "punch_in" : {
-            "$lte" : ts
+            "$lte" : ts + timedelta(milliseconds=999)
         }
     } , sort = [("punch_in", -1)])
     if rec is None:
         raise HTTPException(404, "Punch_in not found")
-    if rec["punch_out"] is not None:
+    if rec.get("punch_out") is not None:
         raise HTTPException(409, "Already Punched Out")
     punch_in_dt = rec["punch_in"]
     if punch_in_dt.tzinfo is None:
         punch_in_dt = punch_in_dt.replace(tzinfo=timezone.utc)
+    punch_in_dt = punch_in_dt.replace(microsecond=0)
     diff_sec = (ts - punch_in_dt).total_seconds()
     if diff_sec <=0 or diff_sec > 24 * 3600:
         raise HTTPException(422 , "invalid punched at")
@@ -313,8 +314,10 @@ def punchOut(body : PunchOutIn):
             raise HTTPException(409, "already punched out")
         raise HTTPException(404, "no punch-in found")
     updated.pop("_id", None)
-    updated["punch_in"] = dt_to_ms(updated["punch_in"])
+    updated["punch_in"] = dt_to_ms(updated["punch_in"].replace(tzinfo=timezone.utc).replace(microsecond=0) if isinstance(updated["punch_in"], datetime) else updated["punch_in"])
     updated["punch_out"] = dt_to_ms(updated["punch_out"])
+    updated["late_minutes"] = updated.get("late_minutes", 0) or 0
+    updated["overtime_minutes"] = updated.get("overtime_minutes", 0) or 0
     updated["history"] = updated.get("history", []) or []
     for h in updated["history"]:
         if isinstance(h.get("at"), datetime):
