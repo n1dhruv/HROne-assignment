@@ -19,6 +19,7 @@ from pymongo import MongoClient
 from datetime import date as dt
 from typing import Literal
 from pymongo.errors import DuplicateKeyError
+from decimal import Decimal , ROUND_HALF_UP
 
 load_dotenv()
 
@@ -54,8 +55,8 @@ def compute_late_minutes(punch_in: datetime, shift_start: str, shift_end: str | 
 
 
 def compute_work_hours(punch_in: datetime, punch_out: datetime) -> float:
-    return round((punch_out - punch_in).total_seconds() / 3600, 2)
-
+    seconds = int((punch_out - punch_in).total_seconds())
+    return float((Decimal(seconds)/Decimal(3600)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
 
 def compute_overtime(punch_out: datetime, shift_end: str, date_str: str) -> int:
     h, m = map(int, shift_end.split(":"))
