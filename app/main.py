@@ -34,6 +34,9 @@ app = FastAPI(title="Employee Attendance & Analytics API", version="2.0.0")
 def create_indexes():
     db.employees.create_index("emp_code", unique=True)
     db.attendance_logs.create_index([("emp_code", 1), ("date", 1)], unique=True)
+    db.employees.create_index("department")
+    db.attendance_logs.create_index([("date", -1), ("emp_code", 1)])
+    db.attendance_logs.create_index("status")
 
 # --------------------------------------------------------------------------- #
 # Helpers
