@@ -117,6 +117,12 @@ class PunchInIn(BaseModel):
     punched_at: Optional[StrictInt] = Field(default=None, ge=100000000000, le=4102444800000)
     status: Literal["PRESENT", "WFH", "ON_DUTY"] = "PRESENT"
 
+    @model_validator(mode="after")
+    def reject_null_punched(self):
+        if "punched_at" in self.model_fields_set and self.punched_at is None:
+            raise ValueError("punched_at must be integer if supplied")
+        return self
+
 
 # --------------------------------------------------------------------------- #
 # Endpoints provided
@@ -208,10 +214,12 @@ def list_attendance(
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1 , le=100),
 ):
-    if date_from is not None:
-        dt.fromisoformat(date_from)
-    if date_to is not None:
-            dt.fromisoformat(date_to)
+    for d in (date_from, date_to):
+        if d is not None:
+            try:
+                dt.fromisoformat(d)
+            except ValueError:
+                raise HTTPException(422, f"invalid date: {d}")
     if date_from and date_to and date_from > date_to:
         raise HTTPException(422 , "date_from can not be greater than date_to")
     q = {}
