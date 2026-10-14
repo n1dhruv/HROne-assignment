@@ -148,6 +148,8 @@ def list_employees(department: Optional[str] = None, page: int = Query(1, ge=1),
     skip = (page-1) * page_size 
     total = db.employees.count_documents(q)
     items = list(db.employees.find(q, {"_id": 0}).skip(skip).limit(page_size).sort("emp_code", 1))
+    for it in items:
+        it["created_at"] = dt_to_ms(it["created_at"])
     return {"items": items, "total": total, "page": page, "page_size": page_size}
 
 
