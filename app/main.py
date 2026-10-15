@@ -39,6 +39,8 @@ def create_indexes():
     db.employees.create_index("department")
     db.attendance_logs.create_index([("date", -1), ("emp_code", 1)])
     db.attendance_logs.create_index("status")
+    db.employees.create_index("joined_on")
+    db.employees.create_index([("department", 1), ("joined_on", 1)])
 
 # --------------------------------------------------------------------------- #
 # Helpers
@@ -133,7 +135,7 @@ def count_working_days(start: dt, end: dt) -> int:
         - weekdays_in_first_days(start.toordinal() - 1)
     )
 
-def build_employee_monthly_pipeline(emp_code: str, first: dt, last: dt) -> list[dict]:
+def employee_monthly_pipeline(emp_code: str, first: dt, last: dt) -> list[dict]:
     return [
         {
             "$match": {
@@ -174,6 +176,99 @@ def build_employee_monthly_pipeline(emp_code: str, first: dt, last: dt) -> list[
                 "total_overtime_minutes": {"$sum": {"$ifNull": ["$overtime_minutes", 0]}},
             }
         },
+    ]
+
+
+def department_summary_pipeline(
+    first: dt, last: dt, department: Optional[str] = None,
+) -> list[dict]:
+    employee_filter: dict = {"joined_on": {"$lte": last.isoformat()}}
+    if department is not None:
+        employee_filter["department"] = department
+
+    has_work_hours = {"$and": [
+        "$_is_present",
+        {"$ne": [{"$ifNull": ["$work_hours", None]}, None]},
+    ]}
+    # Work hours are nonnegative. floor(value * 100 + 0.5) gives half-up rounding.
+    rounded_average = {"$toDouble": {"$divide": [
+        {"$floor": {"$add": [
+            {"$multiply": [{"$divide": ["$_work_sum", "$_work_count"]}, 100]},
+            {"$toDecimal": "0.5"},
+        ]}},
+        100,
+    ]}}
+
+    return [
+        {"$match": employee_filter},
+        {"$lookup": {
+            "from": "attendance_logs",
+            "localField": "emp_code",
+            "foreignField": "emp_code",
+            "pipeline": [
+                {"$match": {"date": {
+                    "$gte": first.isoformat(), "$lte": last.isoformat(),
+                }}},
+                {"$set": {
+                    "_is_present": {"$in": ["$status", ["PRESENT", "WFH", "ON_DUTY"]]},
+                    "_is_weekday": {"$lte": [
+                        {"$isoDayOfWeek": {"$dateFromString": {
+                            "dateString": "$date", "format": "%Y-%m-%d",
+                        }}},
+                        5,
+                    ]},
+                }},
+                {"$group": {
+                    "_id": None,
+                    "present_days": {"$sum": {"$cond": [
+                        {"$and": ["$_is_present", "$_is_weekday"]},
+                        {"$cond": [{"$ifNull": ["$half_day", False]}, 0.5, 1]},
+                        0,
+                    ]}},
+                    "work_sum": {"$sum": {"$cond": [
+                        has_work_hours, {"$toDecimal": "$work_hours"}, {"$toDecimal": 0},
+                    ]}},
+                    "work_count": {"$sum": {"$cond": [has_work_hours, 1, 0]}},
+                    "late_count": {"$sum": {"$cond": [
+                        {"$gt": [{"$ifNull": ["$late_minutes", 0]}, 0]}, 1, 0,
+                    ]}},
+                    "total_late_minutes": {"$sum": {"$ifNull": ["$late_minutes", 0]}},
+                    "leave_count": {"$sum": {"$cond": [
+                        {"$eq": ["$status", "LEAVE"]}, 1, 0,
+                    ]}},
+                    "on_duty_count": {"$sum": {"$cond": [
+                        {"$eq": ["$status", "ON_DUTY"]}, 1, 0,
+                    ]}},
+                }},
+            ],
+            "as": "_attendance",
+        }},
+        {"$unwind": {"path": "$_attendance", "preserveNullAndEmptyArrays": True}},
+        {"$group": {
+            "_id": "$department",
+            "headcount": {"$sum": 1},
+            "present_days": {"$sum": {"$ifNull": ["$_attendance.present_days", 0]}},
+            "_work_sum": {"$sum": {"$ifNull": ["$_attendance.work_sum", {"$toDecimal": 0}]}},
+            "_work_count": {"$sum": {"$ifNull": ["$_attendance.work_count", 0]}},
+            "late_count": {"$sum": {"$ifNull": ["$_attendance.late_count", 0]}},
+            "total_late_minutes": {"$sum": {"$ifNull": ["$_attendance.total_late_minutes", 0]}},
+            "leave_count": {"$sum": {"$ifNull": ["$_attendance.leave_count", 0]}},
+            "on_duty_count": {"$sum": {"$ifNull": ["$_attendance.on_duty_count", 0]}},
+        }},
+        {"$project": {
+            "_id": 0,
+            "department": "$_id",
+            "headcount": 1,
+            "present_days": 1,
+            "avg_work_hours": {"$cond": [
+                {"$gt": ["$_work_count", 0]}, rounded_average, None,
+            ]},
+            "late_count": 1,
+            "total_late_minutes": 1,
+            "leave_count": 1,
+            "on_duty_count": 1,
+        }},
+        {"$sort": {"department": 1}},
     ]
 
 # --------------------------------------------------------------------------- #
@@ -236,6 +331,22 @@ class RegularizeIn(BaseModel):
                 if getattr(self, field) is None:
                     raise ValueError(f"{field} cannot be null")
         return self
+
+class DepartmentSummaryItem(BaseModel):
+    department: str
+    headcount: int
+    present_days: float
+    avg_work_hours: Optional[float]
+    late_count: int
+    total_late_minutes: int
+    leave_count: int
+    on_duty_count: int
+
+
+class DepartmentSummaryOut(BaseModel):
+    month: str
+    items: list[DepartmentSummaryItem]
+
 
 # --------------------------------------------------------------------------- #
 # Endpoints provided
@@ -566,7 +677,7 @@ def employee_monthly(
     joined_on = dt.fromisoformat(emp["joined_on"])
     working_days = count_working_days(max(first, joined_on), last)
 
-    pipeline = build_employee_monthly_pipeline(emp_code, first, last)
+    pipeline = employee_monthly_pipeline(emp_code, first, last)
     summary = next(iter(db.attendance_logs.aggregate(pipeline)), {})
     present_days = summary.get("present_days", 0)
 
@@ -587,12 +698,21 @@ def employee_monthly(
         "attendance_pct": attendance_pct,
     }
 
+@app.get("/analytics/departments/summary", response_model=DepartmentSummaryOut)
+def department_summary(
+    month: str = Query(..., pattern=r"^\d{4}-(0[1-9]|1[0-2])$"),
+    department: Optional[str] = None,
+):
+    first, last = get_month_dates(month)
+    pipeline = department_summary_pipeline(first, last, department)
+    items = list(db.employees.aggregate(pipeline))
+    return {"month": month, "items": items}
+
 
 # --------------------------------------------------------------------------- #
 # TODO - the rest of the contract (see openapi.yaml):
 #   POST  /attendance/punch-out
 #   PATCH /attendance/{emp_code}/{date}
-#   GET   /analytics/departments/summary
 #   GET   /analytics/leaderboard/late
 #   GET   /analytics/departments/{department}/trend
 #   GET   /admin/explain/{endpoint}
