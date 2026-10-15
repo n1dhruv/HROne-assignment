@@ -319,6 +319,123 @@ def late_leaderboard_pipeline(
     return pipeline
 
 
+def get_trend_dates(date_from: str, date_to: str) -> tuple[dt, dt]:
+    try:
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date_from):
+            raise ValueError
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date_to):
+            raise ValueError
+        first = dt.fromisoformat(date_from)
+        last = dt.fromisoformat(date_to)
+    except ValueError:
+        raise HTTPException(422, "Invalid date")
+    days = (last - first).days + 1
+    if days < 1 or days > 92:
+        raise HTTPException(422, "Date range must contain between 1 and 92 days")
+    return first, last
+
+
+def half_up_expression(value: dict | str, places: int) -> dict:
+    # Attendance rates are nonnegative; use decimals to preserve half-up ties.
+    scale = 10 ** places
+    return {"$toDouble": {"$divide": [
+        {"$floor": {"$add": [
+            {"$multiply": [value, scale]}, {"$toDecimal": "0.5"},
+        ]}},
+        scale,
+    ]}}
+
+
+def department_trend_pipeline(department: str, first: dt, last: dt) -> list[dict]:
+    days = (last - first).days + 1
+    start = datetime(first.year, first.month, first.day, tzinfo=timezone.utc)
+    return [
+        {"$match": {"department": department}},
+        {"$limit": 1},
+        # Generate every calendar day in MongoDB, even when there are no logs.
+        {"$project": {
+            "_id": 0, "department": 1,
+            "_days": {"$map": {
+                "input": {"$range": [0, days]}, "as": "offset",
+                "in": {"$dateAdd": {
+                    "startDate": start, "unit": "day", "amount": "$$offset",
+                }},
+            }},
+        }},
+        {"$unwind": "$_days"},
+        {"$set": {
+            "date": {"$dateToString": {"date": "$_days", "format": "%Y-%m-%d"}},
+            "is_working_day": {"$lte": [{"$isoDayOfWeek": "$_days"}, 5]},
+        }},
+        {"$lookup": {
+            "from": "employees", "localField": "department", "foreignField": "department",
+            "let": {"day": "$date"},
+            "pipeline": [
+                {"$match": {"$expr": {"$lte": ["$joined_on", "$$day"]}}},
+                {"$count": "count"},
+            ],
+            "as": "_headcount",
+        }},
+        {"$lookup": {
+            "from": "attendance_logs", "localField": "date", "foreignField": "date",
+            "pipeline": [
+                {"$lookup": {
+                    "from": "employees", "localField": "emp_code", "foreignField": "emp_code",
+                    "pipeline": [
+                        {"$match": {"department": department}},
+                        {"$project": {"_id": 0, "emp_code": 1}},
+                    ],
+                    "as": "_employee",
+                }},
+                {"$unwind": "$_employee"},
+                {"$group": {
+                    "_id": None,
+                    "present_count": {"$sum": {"$cond": [
+                        {"$in": ["$status", ["PRESENT", "WFH", "ON_DUTY"]]},
+                        {"$cond": [{"$ifNull": ["$half_day", False]}, 0.5, 1]},
+                        0,
+                    ]}},
+                    "late_count": {"$sum": {"$cond": [
+                        {"$gt": [{"$ifNull": ["$late_minutes", 0]}, 0]}, 1, 0,
+                    ]}},
+                }},
+            ],
+            "as": "_attendance",
+        }},
+        {"$set": {
+            "headcount": {"$ifNull": [{"$arrayElemAt": ["$_headcount.count", 0]}, 0]},
+            "present_count": {"$ifNull": [{"$arrayElemAt": ["$_attendance.present_count", 0]}, 0]},
+            "late_count": {"$ifNull": [{"$arrayElemAt": ["$_attendance.late_count", 0]}, 0]},
+        }},
+        {"$set": {
+            "attendance_rate": {"$cond": [
+                {"$and": ["$is_working_day", {"$gt": ["$headcount", 0]}]},
+                half_up_expression({"$divide": [
+                    {"$toDecimal": "$present_count"}, "$headcount",
+                ]}, 4),
+                None,
+            ]},
+        }},
+        {"$setWindowFields": {
+            "sortBy": {"date": 1},
+            "output": {"_moving_average": {
+                "$avg": {"$toDecimal": "$attendance_rate"},
+                "window": {"documents": [-6, "current"]},
+            }},
+        }},
+        {"$project": {
+            "_id": 0, "date": 1, "is_working_day": 1, "headcount": 1,
+            "present_count": 1, "late_count": 1, "attendance_rate": 1,
+            "moving_avg_7d": {"$cond": [
+                {"$ne": ["$_moving_average", None]},
+                half_up_expression("$_moving_average", 4),
+                None,
+            ]},
+        }},
+        {"$sort": {"date": 1}},
+    ]
+
+
 # --------------------------------------------------------------------------- #
 # Models
 # --------------------------------------------------------------------------- #
@@ -408,6 +525,21 @@ class LateLeaderboardItem(BaseModel):
 class LateLeaderboardOut(BaseModel):
     month: str
     items: list[LateLeaderboardItem]
+
+
+class DepartmentTrendItem(BaseModel):
+    date: str
+    is_working_day: bool
+    headcount: int
+    present_count: float
+    late_count: int
+    attendance_rate: Optional[float]
+    moving_avg_7d: Optional[float]
+
+
+class DepartmentTrendOut(BaseModel):
+    department: str
+    items: list[DepartmentTrendItem]
 
 
 # --------------------------------------------------------------------------- #
@@ -783,11 +915,24 @@ def late_leaderboard(
     return {"month": month, "items": items}
 
 
+@app.get("/analytics/departments/{department}/trend", response_model=DepartmentTrendOut)
+def department_trend(
+    department: str,
+    date_from: str = Query(..., alias="from", pattern=r"^\d{4}-\d{2}-\d{2}$"),
+    date_to: str = Query(..., alias="to", pattern=r"^\d{4}-\d{2}-\d{2}$"),
+):
+    first, last = get_trend_dates(date_from, date_to)
+    if db.employees.find_one({"department": department}, {"_id": 1}) is None:
+        raise HTTPException(404, "Department not found")
+    pipeline = department_trend_pipeline(department, first, last)
+    items = list(db.employees.aggregate(pipeline))
+    return {"department": department, "items": items}
+
+
 # --------------------------------------------------------------------------- #
 # TODO - the rest of the contract (see openapi.yaml):
 #   POST  /attendance/punch-out
 #   PATCH /attendance/{emp_code}/{date}
 #   GET   /analytics/leaderboard/late
-#   GET   /analytics/departments/{department}/trend
 #   GET   /admin/explain/{endpoint}
 # --------------------------------------------------------------------------- #
