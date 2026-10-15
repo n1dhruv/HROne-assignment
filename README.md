@@ -24,3 +24,7 @@ MongoDB **6.0 or newer** is required (the grader uses 7.0). MongoDB Atlas free t
 ## Submit
 A public Git repository with `app/main.py`, `requirements.txt`, `REVIEW.md`, `DECISIONS.md` and a short `README.md`.
 No `.env`, no secrets, no Dockerfile.
+
+## Unfinished work
+
+`GET /admin/explain/{endpoint}` is unfinished because I did not fully understand that part of the problem statement and ran out of time.
