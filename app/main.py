@@ -21,6 +21,7 @@ from datetime import date as dt
 from typing import Literal
 from pymongo.errors import DuplicateKeyError
 from decimal import Decimal , ROUND_HALF_UP
+from calendar import monthrange
 
 load_dotenv()
 
@@ -106,7 +107,74 @@ def times_to_ms(value):
             for key, item in value.items()
         }
     return value
-    
+
+def get_month_dates(month: str) -> tuple[dt, dt]:
+    try:
+        first = dt.fromisoformat(f"{month}-01")
+    except ValueError:
+        raise HTTPException(422, "Invalid month")
+
+    last_day = monthrange(first.year, first.month)[1]
+    last = dt(first.year, first.month, last_day)
+
+    return first, last
+
+
+def count_working_days(start: dt, end: dt) -> int:
+    if start > end:
+        return 0
+
+    def weekdays_in_first_days(number: int) -> int:
+        weeks, remaining = divmod(number, 7)
+        return weeks * 5 + min(remaining, 5)
+
+    return (
+        weekdays_in_first_days(end.toordinal())
+        - weekdays_in_first_days(start.toordinal() - 1)
+    )
+
+def build_employee_monthly_pipeline(emp_code: str, first: dt, last: dt) -> list[dict]:
+    return [
+        {
+            "$match": {
+                "emp_code": emp_code,
+                "date": {"$gte": first.isoformat(), "$lte": last.isoformat()},
+            }
+        },
+        {
+            "$set": {
+                "_is_weekday": {
+                    "$lte": [
+                        {"$isoDayOfWeek": {"$dateFromString": {
+                            "dateString": "$date", "format": "%Y-%m-%d",
+                        }}},
+                        5,
+                    ]
+                }
+            }
+        },
+        {
+            "$group": {
+                "_id": None,
+                "present_days": {"$sum": {"$cond": [
+                    {"$and": [
+                        "$_is_weekday",
+                        {"$in": ["$status", ["PRESENT", "WFH", "ON_DUTY"]]},
+                    ]},
+                    {"$cond": [{"$ifNull": ["$half_day", False]}, 0.5, 1]},
+                    0,
+                ]}},
+                "leave_days": {"$sum": {"$cond": [
+                    {"$eq": ["$status", "LEAVE"]}, 1, 0,
+                ]}},
+                "late_count": {"$sum": {"$cond": [
+                    {"$gt": [{"$ifNull": ["$late_minutes", 0]}, 0]}, 1, 0,
+                ]}},
+                "total_late_minutes": {"$sum": {"$ifNull": ["$late_minutes", 0]}},
+                "total_overtime_minutes": {"$sum": {"$ifNull": ["$overtime_minutes", 0]}},
+            }
+        },
+    ]
 
 # --------------------------------------------------------------------------- #
 # Models
@@ -486,12 +554,44 @@ def regularize_attendance(
     }
     return times_to_ms(response)
 
+@app.get("/analytics/employees/{emp_code}/monthly")
+def employee_monthly(
+    emp_code: str,
+    month: str = Query(..., pattern=r"^\d{4}-(0[1-9]|1[0-2])$"),
+):
+    first, last = get_month_dates(month)
+    emp = db.employees.find_one({"emp_code": emp_code})
+    if emp is None:
+        raise HTTPException(404, "Employee not found")
+    joined_on = dt.fromisoformat(emp["joined_on"])
+    working_days = count_working_days(max(first, joined_on), last)
+
+    pipeline = build_employee_monthly_pipeline(emp_code, first, last)
+    summary = next(iter(db.attendance_logs.aggregate(pipeline)), {})
+    present_days = summary.get("present_days", 0)
+
+    attendance_pct = None
+    if working_days > 0:
+        percentage = Decimal(str(present_days)) / Decimal(working_days) * Decimal(100)
+        attendance_pct = float(percentage.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+
+    return {
+        "emp_code": emp_code,
+        "month": month,
+        "working_days": working_days,
+        "present_days": present_days,
+        "leave_days": summary.get("leave_days", 0),
+        "late_count": summary.get("late_count", 0),
+        "total_late_minutes": summary.get("total_late_minutes", 0),
+        "total_overtime_minutes": summary.get("total_overtime_minutes", 0),
+        "attendance_pct": attendance_pct,
+    }
+
 
 # --------------------------------------------------------------------------- #
 # TODO - the rest of the contract (see openapi.yaml):
 #   POST  /attendance/punch-out
 #   PATCH /attendance/{emp_code}/{date}
-#   GET   /analytics/employees/{emp_code}/monthly
 #   GET   /analytics/departments/summary
 #   GET   /analytics/leaderboard/late
 #   GET   /analytics/departments/{department}/trend
