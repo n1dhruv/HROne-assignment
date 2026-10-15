@@ -9,6 +9,7 @@ works, but nobody has reviewed it. Read PROBLEM_STATEMENT.docx for what is expec
 openapi.yaml for the contract and DATA_MODEL.md for what is stored in MongoDB.
 """
 import os
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -85,6 +86,26 @@ def dt_to_ms(dt: datetime)-> int:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo = timezone.utc)
     return int(dt.timestamp() * 1000)
+
+def as_utc(value):
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def times_to_ms(value):
+    if isinstance(value, datetime):
+        return dt_to_ms(value)
+    if isinstance(value, list):
+        return [times_to_ms(item) for item in value]
+    if isinstance(value, dict):
+        return {
+            key: times_to_ms(item)
+            for key, item in value.items()
+        }
+    return value
     
 
 # --------------------------------------------------------------------------- #
@@ -131,6 +152,21 @@ class PunchOutIn(BaseModel):
     def reject_null_punched(self):
         if "punched_at" in self.model_fields_set and self.punched_at is None:
             raise ValueError("punched_at must be integer if supplied")
+        return self
+    
+class RegularizeIn(BaseModel):
+    reason: str = Field(min_length=5, max_length=200)
+    regularized_by: str = Field(min_length=1, max_length=50)
+    status: Optional[Literal["PRESENT", "ABSENT", "LEAVE", "WFH", "ON_DUTY"]] = None
+    punch_in: Optional[StrictInt] = Field(default=None,ge=100000000000,le=4102444800000,)
+    punch_out: Optional[StrictInt] = Field(default=None,ge=100000000000,le=4102444800000,)
+
+    @model_validator(mode="after")
+    def reject_sent_nulls(self):
+        for field in ("status", "punch_in", "punch_out"):
+            if field in self.model_fields_set:
+                if getattr(self, field) is None:
+                    raise ValueError(f"{field} cannot be null")
         return self
 
 # --------------------------------------------------------------------------- #
@@ -329,6 +365,127 @@ def punchOut(body : PunchOutIn):
                     if isinstance(v, datetime):
                         h["changes"][fk][bk] = dt_to_ms(v)
     return updated
+
+@app.patch("/attendance/{emp_code}/{date}")
+def regularize_attendance(
+    emp_code: str,
+    date: str,
+    body: RegularizeIn,
+):
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date):
+        raise HTTPException(422, "Invalid date")
+    try:
+        dt.fromisoformat(date)
+    except ValueError:
+        raise HTTPException(422, "Invalid date")
+    emp = db.employees.find_one({"emp_code": emp_code})
+    if emp is None:
+        raise HTTPException(404, "Employee not found")
+    rec = db.attendance_logs.find_one({
+        "emp_code": emp_code,
+        "date": date,
+    })
+    if rec is None:
+        raise HTTPException(404, "Attendance record not found")
+    old = {
+        "status": rec["status"],
+        "punch_in": as_utc(rec.get("punch_in")),
+        "punch_out": as_utc(rec.get("punch_out")),
+        "work_hours": rec.get("work_hours"),
+        "late_minutes": rec.get("late_minutes", 0),
+        "overtime_minutes": rec.get("overtime_minutes", 0),
+        "half_day": rec.get("half_day", False),
+    }
+    new = old.copy()
+    sent = body.model_fields_set
+    if "status" in sent:
+        new["status"] = body.status
+    for field in ("punch_in", "punch_out"):
+        if field in sent:
+            milliseconds = getattr(body, field)
+            new[field] = datetime.fromtimestamp(
+                milliseconds // 1000,
+                tz=timezone.utc,
+            )
+    for field in ("punch_in", "punch_out"):
+        if new[field] is not None:
+            new[field] = new[field].replace(microsecond=0)
+    if new["status"] in ("ABSENT", "LEAVE"):
+        if "punch_in" in sent or "punch_out" in sent:
+            raise HTTPException(422,"ABSENT or LEAVE cannot include punch times")
+        new["punch_in"] = None
+        new["punch_out"] = None
+        new["work_hours"] = None
+        new["late_minutes"] = 0
+        new["overtime_minutes"] = 0
+        new["half_day"] = False
+
+    else:
+        if new["punch_in"] is None:
+            raise HTTPException(422,"This status requires a punch-in")
+        attendance_day = attandance_date(new["punch_in"],emp["shift_start"],emp["shift_end"])
+        if attendance_day != date:
+            raise HTTPException(422,"Punch-in must belong to this attendance date")
+        new["late_minutes"] = compute_late_minutes(new["punch_in"],emp["shift_start"],emp["shift_end"],)
+        if new["punch_out"] is None:
+            new["work_hours"] = None
+            new["overtime_minutes"] = 0
+            new["half_day"] = False
+        else:
+            seconds = (new["punch_out"] - new["punch_in"]).total_seconds()
+            if seconds <= 0 or seconds > 24 * 3600:
+                raise HTTPException(422,"Punch-out must be after punch-in and within 24 hours")
+            new["work_hours"] = compute_work_hours(new["punch_in"],new["punch_out"],)
+            new["overtime_minutes"] = compute_overtime(new["punch_out"],emp["shift_end"],date,emp["shift_start"],)
+            new["half_day"] = new["work_hours"] < 4.50
+    changes = {}
+    for field in old:
+        if old[field] != new[field]:
+            changes[field] = {
+                "from": old[field],
+                "to": new[field],
+            }
+    if not changes:
+        raise HTTPException(422, "Nothing changed")
+    history_entry = {
+        "at": datetime.now(timezone.utc).replace(microsecond=0),
+        "by": body.regularized_by,
+        "reason": body.reason,
+        "changes": changes,
+    }
+    save_filter = {"_id": rec["_id"]}
+    for field in (*old.keys(), "history"):
+        if field in rec:
+            save_filter[field] = rec[field]
+        else:
+            save_filter[field] = {"$exists": False}
+    updated = db.attendance_logs.find_one_and_update(
+        save_filter,
+        {
+            "$set": new,
+            "$push": {"history": history_entry},
+        },
+        return_document=ReturnDocument.AFTER,
+    )
+    if updated is None:
+        raise HTTPException(
+            409,
+            "Record changed while you were editing. Try again.",
+        )
+    response = {
+        "emp_code": updated["emp_code"],
+        "date": updated["date"],
+        "status": updated["status"],
+        "punch_in": updated.get("punch_in"),
+        "punch_out": updated.get("punch_out"),
+        "work_hours": updated.get("work_hours"),
+        "late_minutes": updated.get("late_minutes", 0),
+        "overtime_minutes": updated.get("overtime_minutes", 0),
+        "half_day": updated.get("half_day", False),
+        "history": updated.get("history", []),
+    }
+    return times_to_ms(response)
+
 
 # --------------------------------------------------------------------------- #
 # TODO - the rest of the contract (see openapi.yaml):
