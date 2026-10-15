@@ -28,7 +28,4 @@
 
 5. **One thing you would change** if this had to serve 100x the data.
 
-   I would save one monthly summary for each employee. Right now, MongoDB adds up attendance records whenever someone asks for a report. With 100 times more data, repeating that work could make reports slower.
-   The summary would store present days, leave days, late counts, total late minutes and overtime minutes. It would also keep total work hours and the number of completed work records, so department averages stay correct. Monthly reports and the late leaderboard could read these smaller summaries.
-   Whenever a worker punches in, punches out or someone corrects attendance, the affected summary would need updating. The attendance change and summary update should be saved together, so a failed request does not leave different totals.
-   I would keep the original attendance records for daily reports and history. Before making this change, I would measure query times to check whether repeated calculations are actually the main cause of slow reports.
+   I would save monthly totals for each employee so reports do not calculate everything again each time. These totals would be updated when attendance changes. The original records would stay available for daily reports and history.
