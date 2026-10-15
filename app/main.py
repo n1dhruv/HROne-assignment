@@ -271,6 +271,54 @@ def department_summary_pipeline(
         {"$sort": {"department": 1}},
     ]
 
+def late_leaderboard_pipeline(
+    first: dt, last: dt, limit: int, department: Optional[str] = None,
+) -> list[dict]:
+    pipeline: list[dict] = [
+        {"$match": {"date": {
+            "$gte": first.isoformat(), "$lte": last.isoformat(),
+        }}},
+        {"$group": {
+            "_id": "$emp_code",
+            "total_late_minutes": {"$sum": {"$ifNull": ["$late_minutes", 0]}},
+            "late_count": {"$sum": {"$cond": [
+                {"$gt": [{"$ifNull": ["$late_minutes", 0]}, 0]}, 1, 0,
+            ]}},
+        }},
+        {"$match": {"total_late_minutes": {"$gt": 0}}},
+        {"$lookup": {
+            "from": "employees",
+            "localField": "_id",
+            "foreignField": "emp_code",
+            "pipeline": [{"$project": {"_id": 0, "name": 1, "department": 1}}],
+            "as": "_employee",
+        }},
+        {"$unwind": "$_employee"},
+    ]
+    if department is not None:
+        pipeline.append({"$match": {"_employee.department": department}})
+
+    pipeline.extend([
+        {"$setWindowFields": {
+            # Sort only by minutes here so equal totals share the same rank.
+            "sortBy": {"total_late_minutes": -1},
+            "output": {"rank": {"$rank": {}}},
+        }},
+        {"$match": {"rank": {"$lte": limit}}},
+        {"$sort": {"total_late_minutes": -1, "_id": 1}},
+        {"$project": {
+            "_id": 0,
+            "emp_code": "$_id",
+            "name": "$_employee.name",
+            "department": "$_employee.department",
+            "rank": 1,
+            "total_late_minutes": 1,
+            "late_count": 1,
+        }},
+    ])
+    return pipeline
+
+
 # --------------------------------------------------------------------------- #
 # Models
 # --------------------------------------------------------------------------- #
@@ -346,6 +394,20 @@ class DepartmentSummaryItem(BaseModel):
 class DepartmentSummaryOut(BaseModel):
     month: str
     items: list[DepartmentSummaryItem]
+
+
+class LateLeaderboardItem(BaseModel):
+    rank: int
+    emp_code: str
+    name: str
+    department: str
+    total_late_minutes: int
+    late_count: int
+
+
+class LateLeaderboardOut(BaseModel):
+    month: str
+    items: list[LateLeaderboardItem]
 
 
 # --------------------------------------------------------------------------- #
@@ -706,6 +768,18 @@ def department_summary(
     first, last = get_month_dates(month)
     pipeline = department_summary_pipeline(first, last, department)
     items = list(db.employees.aggregate(pipeline))
+    return {"month": month, "items": items}
+
+
+@app.get("/analytics/leaderboard/late", response_model=LateLeaderboardOut)
+def late_leaderboard(
+    month: str = Query(..., pattern=r"^\d{4}-(0[1-9]|1[0-2])$"),
+    limit: int = Query(10, ge=1, le=50),
+    department: Optional[str] = None,
+):
+    first, last = get_month_dates(month)
+    pipeline = late_leaderboard_pipeline(first, last, limit, department)
+    items = list(db.attendance_logs.aggregate(pipeline))
     return {"month": month, "items": items}
 
 
